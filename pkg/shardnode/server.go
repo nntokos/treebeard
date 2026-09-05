@@ -217,6 +217,26 @@ func (s *shardNodeServer) query(ctx context.Context, block string, requestID str
 	finalResponseChannel <- finalResponse{requestId: requestID, value: responseValue, opType: opType, err: nil}
 }
 
+// getStashHarvest scans the resident stash for the given candidate blocks and
+// returns whichever are found, without touching the position map or the
+// stash contents. Piggybacks on the stash lock already taken for ordinary
+// batch service (see getBlocksForSend) -- it is a plain map read, so it costs
+// no extra path I/O. Best-effort / read-only harvest, added 2026-08-03.
+func (s *shardNodeServer) getStashHarvest(blocks []string) map[string]string {
+	if len(blocks) == 0 {
+		return nil
+	}
+	s.shardNodeFSM.stashMu.Lock()
+	defer s.shardNodeFSM.stashMu.Unlock()
+	harvested := make(map[string]string)
+	for _, block := range blocks {
+		if state, exists := s.shardNodeFSM.stash[block]; exists {
+			harvested[block] = state.value
+		}
+	}
+	return harvested
+}
+
 func (s *shardNodeServer) queryBatch(ctx context.Context, request *pb.RequestBatch) (reply *pb.ReplyBatch, err error) {
 	if s.raftNode.State() != raft.Leader {
 		return nil, fmt.Errorf(commonerrs.NotTheLeaderError)
@@ -260,8 +280,9 @@ func (s *shardNodeServer) queryBatch(ctx context.Context, request *pb.RequestBat
 			writeReplies = append(writeReplies, &pb.WriteReply{RequestId: response.requestId, Success: true})
 		}
 	}
+	opportunisticServed := s.getStashHarvest(request.OpportunisticBlocks)
 	querySpan.End()
-	return &pb.ReplyBatch{ReadReplies: readReplies, WriteReplies: writeReplies}, nil
+	return &pb.ReplyBatch{ReadReplies: readReplies, WriteReplies: writeReplies, OpportunisticServed: opportunisticServed}, nil
 }
 
 func (s *shardNodeServer) BatchQuery(ctx context.Context, request *pb.RequestBatch) (*pb.ReplyBatch, error) {

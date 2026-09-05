@@ -11,17 +11,29 @@ service Router {
 
 message ReadRequest {
     string block = 1;
+    // Candidate block ids the caller would like harvested from the serving
+    // shard's stash, at zero extra path I/O, if they happen to be resident.
+    // Best-effort: see ReadReply.opportunistic_served. (Added 2026-08-03.)
+    repeated string opportunistic_blocks = 2;
 }
 
 message ReadReply {
     string value = 1;
+    // Subset of the request's opportunistic_blocks found resident in the
+    // serving shard's stash this epoch fold. May include blocks offered by
+    // OTHER requests folded into the same epoch/shard batch. (Added 2026-08-03.)
+    map<string, string> opportunistic_served = 2;
 }
 
 message WriteRequest {
     string block = 1;
     string value = 2;
+    // See ReadRequest.opportunistic_blocks. (Added 2026-08-03.)
+    repeated string opportunistic_blocks = 3;
 }
 
 message WriteReply {
     bool success = 1;
+    // See ReadReply.opportunistic_served. (Added 2026-08-03.)
+    map<string, string> opportunistic_served = 2;
 }

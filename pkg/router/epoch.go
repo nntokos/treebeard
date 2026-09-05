@@ -40,11 +40,15 @@ const (
 )
 
 type request struct {
-	ctx           context.Context
-	requestId     string
-	operationType int
-	block         string
-	value         string
+	ctx                 context.Context
+	requestId           string
+	operationType       int
+	block               string
+	value               string
+	// Candidate blocks this request offers for opportunistic stash harvest.
+	// See router.proto ReadRequest/WriteRequest.opportunistic_blocks. (Added
+	// 2026-08-03.)
+	opportunisticBlocks []string
 }
 
 func (e *epochManager) addRequestToCurrentEpoch(r *request) chan any {
@@ -71,19 +75,22 @@ func (e *epochManager) whereToForward(block string) (shardNodeID int) {
 }
 
 type readResponse struct {
-	value string
-	err   error
+	value     string
+	harvested map[string]string
+	err       error
 }
 
 type writeResponse struct {
-	success bool
-	err     error
+	success   bool
+	harvested map[string]string
+	err       error
 }
 
 type batchResponse struct {
-	readResponses  []*shardnodepb.ReadReply
-	writeResponses []*shardnodepb.WriteReply
-	err            error
+	readResponses       []*shardnodepb.ReadReply
+	writeResponses      []*shardnodepb.WriteReply
+	opportunisticServed map[string]string
+	err                 error
 }
 
 func (e *epochManager) sendBatch(ctx context.Context, shardnodeClient ReplicaRPCClientMap, requestBatch *shardnodepb.RequestBatch, batchResponseChan chan batchResponse) {
@@ -112,7 +119,8 @@ func (e *epochManager) sendBatch(ctx context.Context, shardnodeClient ReplicaRPC
 		return
 	}
 	log.Debug().Msgf("Received batch of requests from shardnode; reply: %v", reply)
-	batchResponseChan <- batchResponse{readResponses: reply.(*shardnodepb.ReplyBatch).ReadReplies, writeResponses: reply.(*shardnodepb.ReplyBatch).WriteReplies, err: nil}
+	replyBatch := reply.(*shardnodepb.ReplyBatch)
+	batchResponseChan <- batchResponse{readResponses: replyBatch.ReadReplies, writeResponses: replyBatch.WriteReplies, opportunisticServed: replyBatch.OpportunisticServed, err: nil}
 }
 
 func (e *epochManager) getShardnodeBatches(requests []*request) map[int]*shardnodepb.RequestBatch {
@@ -126,6 +134,30 @@ func (e *epochManager) getShardnodeBatches(requests []*request) map[int]*shardno
 			requestBatches[shardNodeID].ReadRequests = append(requestBatches[shardNodeID].ReadRequests, &shardnodepb.ReadRequest{RequestId: r.requestId, Block: r.block})
 		} else {
 			requestBatches[shardNodeID].WriteRequests = append(requestBatches[shardNodeID].WriteRequests, &shardnodepb.WriteRequest{RequestId: r.requestId, Block: r.block, Value: r.value})
+		}
+	}
+	// Route each request's opportunistic candidates to the shard that actually
+	// owns that block (hash of the CANDIDATE, not the requester's own block),
+	// and only into a shard batch that already has real demand this epoch --
+	// harvest must ride an already-scheduled fold, never trigger an extra
+	// BatchQuery of its own. Deduped per shard via a seen-set. (Added
+	// 2026-08-03.)
+	seen := make(map[int]map[string]bool)
+	for _, r := range requests {
+		for _, candidate := range r.opportunisticBlocks {
+			shardNodeID := e.whereToForward(candidate)
+			batch, exists := requestBatches[shardNodeID]
+			if !exists {
+				continue
+			}
+			if seen[shardNodeID] == nil {
+				seen[shardNodeID] = make(map[string]bool)
+			}
+			if seen[shardNodeID][candidate] {
+				continue
+			}
+			seen[shardNodeID][candidate] = true
+			batch.OpportunisticBlocks = append(batch.OpportunisticBlocks, candidate)
 		}
 	}
 	return requestBatches
@@ -149,6 +181,12 @@ func (e *epochManager) sendEpochRequestsAndAnswerThem(epochNumber int, requests 
 		waitingCount++
 		go e.sendBatch(context.Background(), e.shardNodeRPCClients[shardNodeID], shardNodeRequests, batchResponseChan)
 	}
+	// Buffer every shard's reply and merge their opportunistic_served maps
+	// into one union before answering any request: a candidate offered by one
+	// request may live on a different shard than the one serving it, so the
+	// harvest a caller sees should reflect every shard folded into this
+	// epoch, not just its own. (Added 2026-08-03.)
+	var replies []batchResponse
 	timeout := time.After(10 * time.Second)
 	for i := 0; i < waitingCount; i++ {
 		select {
@@ -156,24 +194,33 @@ func (e *epochManager) sendEpochRequestsAndAnswerThem(epochNumber int, requests 
 			log.Error().Msgf("Timed out while waiting for batch response")
 			return
 		case reply := <-batchResponseChan:
-			if reply.err != nil {
-				log.Error().Msgf("Error while sending batch of requests; %s", reply.err)
-				for _, r := range reply.readResponses {
-					responseChans[r.RequestId] <- readResponse{err: reply.err}
-				}
-				for _, r := range reply.writeResponses {
-					responseChans[r.RequestId] <- writeResponse{err: reply.err}
-				}
-				continue
-			}
-			log.Debug().Msgf("Received batch reply %v", reply)
-			log.Debug().Msgf("Answering epoch requests for epoch %d", epochNumber)
+			replies = append(replies, reply)
+		}
+	}
+	harvested := make(map[string]string)
+	for _, reply := range replies {
+		for block, value := range reply.opportunisticServed {
+			harvested[block] = value
+		}
+	}
+	log.Debug().Msgf("Answering epoch requests for epoch %d", epochNumber)
+	for _, reply := range replies {
+		if reply.err != nil {
+			log.Error().Msgf("Error while sending batch of requests; %s", reply.err)
 			for _, r := range reply.readResponses {
-				responseChans[r.RequestId] <- readResponse{value: r.Value}
+				responseChans[r.RequestId] <- readResponse{err: reply.err}
 			}
 			for _, r := range reply.writeResponses {
-				responseChans[r.RequestId] <- writeResponse{success: r.Success}
+				responseChans[r.RequestId] <- writeResponse{err: reply.err}
 			}
+			continue
+		}
+		log.Debug().Msgf("Received batch reply %v", reply)
+		for _, r := range reply.readResponses {
+			responseChans[r.RequestId] <- readResponse{value: r.Value, harvested: harvested}
+		}
+		for _, r := range reply.writeResponses {
+			responseChans[r.RequestId] <- writeResponse{success: r.Success, harvested: harvested}
 		}
 	}
 }

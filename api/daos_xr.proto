@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package daos_xr;
+
+option go_package = "github.com/dsg-uwaterloo/treebeard/api/daos_xr";
+
+enum RequestType {
+  READ = 0;
+  WRITE = 1;
+}
+
+message ClientRequestPb {
+  uint32 request_id = 1;
+  RequestType request_type = 2;
+  uint32 key = 3;
+  bytes value = 4;
+  uint64 send_time_ms = 5;
+  // Optional metadata forwarded to the backend unchanged; not processed by the orchestrator.
+  bytes passthrough_data = 6;
+}
+
+message ClientResponsePb {
+  uint32 request_id = 1;
+  RequestType request_type = 2;
+  uint32 key = 3;
+  bytes value = 4;
+  // Wall-clock epoch_ms at which the proxy received this request. The proxy
+  // logs its own latency metrics (cache hits, queue wait, processing time,
+  // client->queue time, same-key count) to a separate stats file; only this
+  // timestamp travels back so the orchestrator can derive orchestrator->proxy
+  // latency.
+  uint64 proxy_received_ms = 5;
+  uint64 client_to_orchestrator_time = 6;
+  uint64 orchestrator_processing_time = 7;
+  uint64 orchestrator_to_proxy_time = 8;
+  // Wall-clock epoch_ms when the proxy finished servicing the request and
+  // emitted the response. With proxy_received_ms it bounds the backend-service
+  // segment (queue wait + storage processing). 0 for orchestrator cache hits.
+  uint64 proxy_responded_ms = 9;
+  // Wall-clock epoch_ms when the orchestrator received this response back from
+  // the backend. With proxy_responded_ms it bounds the backend->orchestrator
+  // return leg. 0 for orchestrator cache hits.
+  uint64 orch_resp_received_ms = 10;
+  // True when the response was served directly from the orchestrator cache
+  // (never forwarded to the backend). Lets the client split latency by path.
+  bool orch_cache_hit = 11;
+  // 13-16 previously carried per-batch prefetch metrics; prefetching is now an
+  // orchestrator-internal concern reported only in orchestrator-stats.csv.
+  reserved 13, 14, 15, 16;
+}
+
+// XR-native streaming request. Carries a 360-degree video TILE coordinate, not a
+// storage block. The orchestrator owns the storage-layout mapping: it resolves
+// (video, chunk, tile, quality) to a u32 base key via the manifest and splits the
+// tile into ceil(tile_size / object_size) fixed-size block reads before talking to
+// the backend. The backend never sees any of these fields. video_id is an opaque
+// string (e.g. a YouTube id) — it is never interpreted numerically.
+message XrRequestPb {
+  string request_id   = 1;   // client-assigned, unique per session (the tile request id)
+  string video_id     = 2;
+  uint32 chunk_id     = 3;
+  uint32 tile_id      = 4;
+  uint32 quality      = 5;
+  uint64 tile_size    = 6;   // bytes; the orchestrator derives the block count
+  string requester_id = 7;   // opaque viewer id; never interpreted numerically
+  uint64 send_time_ms = 8;   // client send epoch_ms (for client->orchestrator latency)
+  // Pre-resolved storage base block (from an ingest-augmented trace). When set,
+  // the orchestrator uses it directly and skips the manifest lookup; when unset
+  // the orchestrator resolves the coordinate via the manifest.
+  optional uint32 base_block = 9;
+}
+
+// XR-native streaming response: one per tile, emitted once all of the tile's
+// blocks have come back from the backend (tile-completion semantics).
+message XrResponsePb {
+  string request_id = 1;     // echoes the tile request id
+  string video_id   = 2;
+  uint32 chunk_id   = 3;
+  uint32 tile_id    = 4;
+  uint32 quality    = 5;
+  uint32 blocks     = 6;     // blocks fetched for this tile
+  uint64 total_bytes = 7;    // sum of returned block payload sizes
+  uint32 base_key   = 8;     // flattened storage key of the tile (block 0), for logging/analysis
+  // Aggregated latency breakdown (taken from the tile's last/longest block).
+  uint64 client_to_orchestrator_time = 9;
+  uint64 orchestrator_processing_time = 10;
+  uint64 orchestrator_to_proxy_time = 11;
+  // Post-orchestrator latency breakdown, taken from the tile's critical
+  // (slowest end-to-end) block — consistent with the c2o/proc/o2p split above.
+  // backend_service = proxy queue wait + storage processing; return leg =
+  // backend -> orchestrator. The orchestrator -> client leg is the client-side
+  // residual. 0 when the critical block was served from the orchestrator cache.
+  uint64 backend_service_ms = 16;
+  uint64 return_backend_to_orch_ms = 17;
+  // True when the tile's critical block was served from the orchestrator cache.
+  bool orch_cache_hit = 18;
+  // 12-15 previously carried per-batch prefetch metrics; prefetching is now an
+  // orchestrator-internal concern reported only in orchestrator-stats.csv.
+  reserved 12, 13, 14, 15;
+}
+
+// --- Capability negotiation (optional) -----------------------------------
+// The orchestrator calls GetCapabilities once at startup. UNION is the only
+// optional wire contract: a backend advertising it implements strict UnionSession.
+// Batch pacing and opportunistic harvest use the common message shape and require
+// no capability. `hints` carries optional safe tuning bounds.
+enum BackendCapability {
+  BACKEND_CAPABILITY_UNSPECIFIED = 0;
+  BACKEND_CAPABILITY_UNION = 1; // serves BackendIngress.UnionSession
+}
+
+message CapabilitiesReq {}
+
+message CapabilitiesPb {
+  repeated BackendCapability capabilities = 1; // the set the backend implements
+  map<string, uint32> hints = 2;               // e.g. "max_opportunistic_keys", "stash_capacity",
+                                               // "union_align_width" (rORAM native range
+                                               // window = 2^(num_orams-1); the orchestrator
+                                               // derives batch_align_width from it)
+}
+
+// Capability handle, kept as a SEPARATE service so a backend that knows nothing of
+// it (the Cloak proxy) simply does not serve it.
+service Capability {
+  rpc GetCapabilities(CapabilitiesReq) returns (CapabilitiesPb);
+}
+
+// An opportunistic response is a candidate value the backend encountered while
+// serving the committed operation. Returning it must not trigger extra backend I/O.
+message OpportunisticBlockPb {
+  uint32 key = 1;
+  bytes value = 2;
+}
+
+// --- Unified orchestrator -> backend carrier ------------------------------
+// BackendSession processes committed requests in order with normal backend
+// semantics. UnionSession accepts read-only batches and MUST serve every committed
+// request in exactly one backend-native operation/epoch. Both may return any
+// opportunistic candidates encountered by that same operation.
+message BatchRequestPb {
+  uint64 batch_id = 1;
+  repeated ClientRequestPb committed = 2;
+  repeated uint32 opportunistic_keys = 3;
+}
+
+message BatchResponsePb {
+  uint64 batch_id = 1;
+  // Exactly one response per committed request, in request order.
+  repeated ClientResponsePb responses = 2;
+  // Subset of `opportunistic_keys` encountered without an extra access.
+  repeated OpportunisticBlockPb opportunistic_served = 3;
+}
+
+// Backend gRPC ingress -- used only when an orchestrator dials the backend.
+service BackendIngress {
+  rpc BackendSession(stream BatchRequestPb) returns (stream BatchResponsePb);
+  rpc UnionSession(stream BatchRequestPb) returns (stream BatchResponsePb);
+}
+
+// Orchestrator gRPC ingress -- used by clients that opted into the orchestrator path.
+service OrchestratorIngress {
+  rpc ClientSession(stream ClientRequestPb) returns (stream ClientResponsePb);
+  // XR-native streaming path. The orchestrator flattens + splits each tile into
+  // storage blocks internally; the backend contract is unchanged.
+  rpc XrClientSession(stream XrRequestPb) returns (stream XrResponsePb);
+}
