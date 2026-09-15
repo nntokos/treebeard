@@ -1,13 +1,76 @@
-# oasis-adapter changes
+# oasis-adapter-og changes
 
-Branch: `oasis-adapter`
+Branch: `oasis-adapter-og`
 Origin: `git@github.com:nntokos/treebeard.git` (cloned from upstream, remote renamed)
 Upstream: `https://github.com/dsg-uwaterloo/treebeard`
-Added: 2026-07-12
+Added: 2026-09-15
 
-## What changed
+## What this fork is, and how it differs from `backends/treebeard`
 
-All changes are additive — nothing in the upstream source is modified.
+`treebeard-og` is the **as-published** Treebeard backend: it carries the daos-xr
+adapter and the opportunistic stash harvest, and **nothing else**. Every storage /
+oramnode correctness fix that `backends/treebeard` (branch `oasis-adapter`) applies on
+top of upstream is reverted here, so the ORAM data path is byte-for-byte
+`upstream/main`.
+
+The two forks exist so the orchestrator can be evaluated against the backend as its
+authors shipped it (`treebeard-og`) and against a repaired backend (`treebeard`),
+without either arm silently standing in for the other. They are separate backends end
+to end: separate fork checkout, separate ansible playbook tree
+(`experiments/treebeard-og/ansible/`), separate `/tmp` build+storage root, separate
+experiment tree. They are never run concurrently and never share a result directory.
+
+### Reverted relative to `backends/treebeard` (2026-09-15)
+
+These five files are restored to `upstream/main` verbatim
+(`git checkout upstream/main -- <file>`); `git diff upstream/main -- pkg/storage pkg/oramnode`
+is empty on this branch.
+
+| File | Fix present in `treebeard`, absent here |
+|------|----------------------------------------|
+| `pkg/storage/storage.go` | `selectDummyBlock()` — scan for any surviving dummy slot instead of assuming `dummy1` (resp. `dummy1..dummyN` in order) is still valid. Upstream's `BatchReadBucket` miss path returns `nil, err` with `err == nil`. |
+| `pkg/storage/storage.go` | `BatchReadBucket` now checks the error from `BatchGetAllMetaData`; upstream discards it. |
+| `pkg/storage/storage.go` | `BatchReadBlock` post-read invalidation. Upstream matches a metadata *value* against the physical offset and `HSet`s at that physical position; the fix resolves the physical offset back to its **logical** metadata field first. Upstream also builds its `bucketIDs` slice with `make(..., len)` + `append`, so half of it is zero values. |
+| `pkg/storage/storage_helper.go` | `metadataFieldForOffset()` / `batchGetMetadataFieldsForOffsets()` — the helpers the above invalidation fix needs. |
+| `pkg/oramnode/server.go` | `earlyReshuffle` write-back. Upstream fires `go o.storageHandler.BatchWriteBucket(...)` and drops the result; the fix makes it synchronous and propagates the error. |
+| `pkg/oramnode/server.go` | `ReadPath` returned a stale outer `err` (usually `nil`) on a block-read failure, masking it; the fix wraps `response.err`. |
+| `pkg/storage/storage_test.go`, `pkg/storage/storage_helper_test.go` | The unit tests covering the two fixes above. |
+
+**Expected consequence.** This arm can and does surface the upstream faults the fixes
+were written for — wrong-slot metadata invalidation, dummy-slot exhaustion, and reshuffle
+write-backs whose failure is never observed. Errors of the shape `could not get offset
+from storage`, short or empty demand reads, and delivery-validation rejections are
+therefore *results* on this arm, not run faults, and must not be "fixed" by importing
+patches from `backends/treebeard`. If a run on this arm fails, record it; do not repair
+the backend.
+
+### Kept here, identical to `backends/treebeard`
+
+- The whole daos-xr adapter: `cmd/grpc_server/`, `pkg/grpc_server/`, `api/daos_xr*`,
+  `Makefile`. This is the compatibility shim, not backend behaviour.
+- **Opportunistic stash harvest** (`api/router.proto`, `api/shardnode.proto`,
+  `pkg/router/epoch.go`, `pkg/router/server.go`, `pkg/shardnode/server.go`). Kept
+  deliberately: `getStashHarvest` is a read-only map lookup under a lock the batch path
+  already holds, it adds no path I/O, and it mutates neither the stash nor the position
+  map — it reports state the ORAM already produced. It changes what the backend
+  *exposes*, not what it *does*, so keeping it costs the "as-published" framing nothing
+  while keeping the two arms' adapter surface identical.
+  - One caveat, recorded so it is not mistaken for an accident: the harvest change also
+    restructured `sendEpochRequestsAndAnswerThem` to buffer every shard's reply for an
+    epoch before answering any request, where upstream answered each shard reply as it
+    arrived. Within an epoch a caller now waits for the slowest shard rather than its
+    own. The 10 s epoch timeout is unchanged. This is present on BOTH forks, so it never
+    distinguishes them.
+- Protobuf regeneration noise in `api/*/`: protoc-gen-go 1.33 to 1.34.1, protoc 4.25.3
+  to 3.21.12, and the `go_package` path `dsg-uwaterloo/oblishard` to
+  `dsg-uwaterloo/treebeard`. No wire or semantic change.
+
+Everything below this line is inherited from the `oasis-adapter` branch and applies to
+both forks unless a section says otherwise.
+
+---
+
+## Inherited adapter notes (branch `oasis-adapter`, added 2026-07-12)
 
 ### New files
 

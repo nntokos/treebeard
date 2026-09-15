@@ -132,9 +132,7 @@ func (o *oramNodeServer) earlyReshuffle(buckets []int, storageID int) error {
 		blocksFromReadBucketBatches[i] = response.bucketValues
 	}
 	for _, blocks := range blocksFromReadBucketBatches {
-		if _, err := o.storageHandler.BatchWriteBucket(storageID, blocks, nil); err != nil {
-			return fmt.Errorf("unable to rewrite reshuffled buckets: %w", err)
-		}
+		go o.storageHandler.BatchWriteBucket(storageID, blocks, nil)
 	}
 	return nil
 }
@@ -390,7 +388,7 @@ func (o *oramNodeServer) ReadPath(ctx context.Context, request *pb.ReadPathReque
 		response := <-readBlockResponseChan
 		if response.err != nil {
 			log.Error().Msgf("Could not read block %v; %s", response.values, response.err)
-			return nil, fmt.Errorf("could not read blocks from storage: %w", response.err)
+			return nil, err
 		}
 		for bucketID, value := range response.values {
 			if _, exists := realBlockBucketMapping[bucketID]; exists {
