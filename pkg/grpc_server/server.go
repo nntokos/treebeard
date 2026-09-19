@@ -86,6 +86,19 @@ type Server struct {
 	unionFanoutInflight atomic.Uint64
 	unionFanoutPeak     atomic.Uint64
 
+	// Harvest accounting (2026-09-19). These exist to make the duplication this
+	// adapter used to cause MEASURABLE rather than asserted: harvestReceived counts
+	// every entry the router handed back across all replies, harvestMerged counts
+	// the distinct blocks actually kept. Their ratio is the wire duplication factor
+	// -- 1.0 means every harvested block crossed the router wire exactly once. It
+	// read ~128 before planHarvest, because every request in a batch replayed the
+	// whole candidate list and the router answers each caller with the whole
+	// epoch's merged harvest. Any value above ~1 that survives a run is the
+	// remaining router-side broadcast (pkg/router/epoch.go), not this adapter.
+	harvestOffered  atomic.Uint64
+	harvestReceived atomic.Uint64
+	harvestMerged   atomic.Uint64
+
 	// Blocks answered with an EMPTY value because the access failed or panicked
 	// (2026-07-29). Nonzero means a backend operation genuinely failed — see
 	// degradeBlock. Stream-shutdown cancellation is counted separately because
@@ -139,6 +152,9 @@ func (s *Server) degradeBlock(req *pb.ClientRequestPb, recvMs uint64, cause erro
 // outstanding Router.Read/Write at once (see the unionFanout field doc);
 // values below 1 are clamped to 1, which serialises UNION batches into the
 // same one-at-a-time shape as the non-UNION BackendSession path.
+// The opportunistic-harvest size is the orchestrator's `opportunistic_max` alone;
+// this adapter adds no bound of its own, it only splits the offered list across the
+// batch's requests. See planHarvest.
 func New(router routerpb.RouterClient, params config.Parameters, statsPath string, serveConcurrency int, unionFanout int, validatePreloadPayloads bool) *Server {
 	if serveConcurrency < 1 {
 		serveConcurrency = 1
@@ -235,7 +251,7 @@ func (s *Server) startStatsWriter() {
 	}
 	write := func() {
 		body := fmt.Sprintf(
-			"timestamp_ms,router_inflight_limit,router_inflight,router_inflight_peak,router_admission_waits,router_admission_wait_ms_total,router_admission_wait_ms_max,degraded_blocks,canceled_blocks,union_fanout_limit,union_fanout_peak\n%d,%d,%d,%d,%d,%.3f,%.3f,%d,%d,%d,%d\n",
+			"timestamp_ms,router_inflight_limit,router_inflight,router_inflight_peak,router_admission_waits,router_admission_wait_ms_total,router_admission_wait_ms_max,degraded_blocks,canceled_blocks,union_fanout_limit,union_fanout_peak,harvest_offered,harvest_received,harvest_merged\n%d,%d,%d,%d,%d,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d\n",
 			time.Now().UnixMilli(), cap(s.routerSlots), s.routerInflight.Load(),
 			s.routerInflightPeak.Load(), s.routerAdmissionWaits.Load(),
 			float64(s.routerAdmissionWaitNs.Load())/float64(time.Millisecond),
@@ -243,6 +259,7 @@ func (s *Server) startStatsWriter() {
 			s.degradedBlocks.Load(),
 			s.canceledBlocks.Load(),
 			cap(s.unionFanoutSlots), s.unionFanoutPeak.Load(),
+			s.harvestOffered.Load(), s.harvestReceived.Load(), s.harvestMerged.Load(),
 		)
 		tmp := s.statsPath + ".tmp"
 		if err := os.WriteFile(tmp, []byte(body), 0644); err != nil {
@@ -390,18 +407,56 @@ func (s *Server) access(ctx context.Context, req *pb.ClientRequestPb, opportunis
 	}
 }
 
-// opportunisticBlockStrings converts the daos-xr keys the orchestrator offered
-// as harvest candidates into Treebeard block ids for the router call. (Added
-// 2026-08-03.)
-func opportunisticBlockStrings(keys []uint32) []string {
-	if len(keys) == 0 {
+// planHarvest splits one batch's offered candidates across that batch's committed
+// requests, returning the candidate list each request should carry. It caps the
+// batch's total harvest first, then strides the survivors across the parts.
+//
+// Why split, rather than give every request the whole list (fixed 2026-09-19):
+// the router answers each caller with the whole epoch's MERGED harvest
+// (pkg/router/epoch.go, "all of an epoch's callers see the whole epoch's
+// harvest"), so N requests offering the same C candidates cost N*C block values
+// on the wire, not C. Measured on treebeard/v11-0 32users/30s: ~128 committed
+// blocks x ~624 candidates at a ~70% stash hit rate moved 439 GB over loopback in
+// a 1,197 s run -- 295x the payload actually delivered to the orchestrator --
+// against the passthrough baseline's 116 GB, and collapsed the arm to 0.28 req/s
+// where the baseline sustained 10.05. The receive side cannot fix this: grpc-go
+// unmarshals OpportunisticServed in full before mergeHarvest ever sees it, so the
+// only lever is what the adapter ASKS for.
+//
+// Splitting keeps the batch's candidate coverage intact -- every retained
+// candidate is still offered exactly once -- and beats nominating one carrier
+// request on every axis that matters here: no single reply becomes the straggler
+// the whole batch waits for under serveUnionBatch's wg.Wait, a failed or canceled
+// request costs 1/N of the harvest instead of all of it, no one protobuf message
+// has to hold the batch's entire harvest at once, and on a multi-shard deployment
+// the candidates ride more epochs -- which matters because getShardnodeBatches
+// drops a candidate whose shard has no real demand in the epoch carrying it.
+//
+// How much harvest a batch pulls back is the orchestrator's `opportunistic_max`
+// and nothing else: the payload is that key count times the size a block occupies
+// on the router wire, and both ends already know both terms. A byte budget here
+// would be a third input to a two-input equation -- redundant when it agrees with
+// `opportunistic_max`, a silent contradiction when it does not -- so this adapter
+// deliberately imposes no ceiling of its own. `harvest_offered` in the stats file
+// reports what it actually forwarded.
+//
+// The split is strided rather than contiguous so that losing any one request costs
+// a uniform sample of the offered range instead of a contiguous band of the
+// orchestrator's soonest-needed-first ordering.
+func (s *Server) planHarvest(keys []uint32, parts int) [][]string {
+	if parts < 1 {
 		return nil
 	}
-	blocks := make([]string, len(keys))
-	for i, key := range keys {
-		blocks[i] = keyToBlock(key)
+	plan := make([][]string, parts)
+	if len(keys) == 0 {
+		return plan
 	}
-	return blocks
+	for i, key := range keys {
+		part := i % parts
+		plan[part] = append(plan[part], keyToBlock(key))
+	}
+	s.harvestOffered.Add(uint64(len(keys)))
+	return plan
 }
 
 // mergeHarvest folds one router call's harvested blocks into the batch-wide
@@ -409,6 +464,7 @@ func opportunisticBlockStrings(keys []uint32) []string {
 // back to a well-formed key are dropped -- harvest is best-effort by
 // contract. (Added 2026-08-03.)
 func (s *Server) mergeHarvest(acc map[uint32][]byte, harvested map[string]string) {
+	s.harvestReceived.Add(uint64(len(harvested)))
 	for block, encoded := range harvested {
 		key, ok := blockToKey(block)
 		if !ok {
@@ -425,6 +481,7 @@ func (s *Server) mergeHarvest(acc map[uint32][]byte, harvested map[string]string
 			continue
 		}
 		acc[key] = val
+		s.harvestMerged.Add(1)
 	}
 }
 
@@ -447,9 +504,14 @@ func opportunisticServedPb(acc map[uint32][]byte) []*pb.OpportunisticBlockPb {
 // daos_xr wire contract carries it unconditionally -- but max_opportunistic_keys
 // bounds how many candidates are worth offering per batch.
 func (s *Server) GetCapabilities(_ context.Context, _ *pb.CapabilitiesReq) (*pb.CapabilitiesPb, error) {
+	// No `max_opportunistic_keys` hint (2026-09-19). The harvest size is set by the
+	// orchestrator's `opportunistic_max` and this adapter imposes no bound behind it,
+	// so there is no second number to advertise. The old value, 4096, was copied from
+	// path-oram, whose blocks are far smaller; at this fork's 102400-byte blocks it
+	// promised a ~560 MB reply, which is the kind of stale constant this removal
+	// avoids reintroducing.
 	return &pb.CapabilitiesPb{
 		Capabilities: []pb.BackendCapability{pb.BackendCapability_BACKEND_CAPABILITY_UNION},
-		Hints:        map[string]uint32{"max_opportunistic_keys": 4096},
 	}, nil
 }
 
@@ -606,10 +668,12 @@ func (s *Server) BackendSession(stream pb.BackendIngress_BackendSessionServer) e
 		batch := queued.batch
 		recvMs := uint64(queued.receivedAt.UnixMilli())
 		responses := make([]*pb.ClientResponsePb, 0, len(batch.Committed))
-		opportunisticBlocks := opportunisticBlockStrings(batch.OpportunisticKeys)
+		// One share of the batch's candidates per request, never the whole list
+		// on every request (2026-09-19). See planHarvest.
+		harvestPlan := s.planHarvest(batch.OpportunisticKeys, len(batch.Committed))
 		harvested := make(map[uint32][]byte)
-		for _, req := range batch.Committed {
-			val, opp, err := s.accessSafe(ctx, req, opportunisticBlocks)
+		for i, req := range batch.Committed {
+			val, opp, err := s.accessSafe(ctx, req, harvestPlan[i])
 			if err != nil {
 				responses = append(responses, s.degradeBlock(req, recvMs, err))
 				continue
@@ -648,11 +712,14 @@ func (s *Server) serveUnionBatch(ctx context.Context, queued queuedBatch) *pb.Ba
 	responses := make([]*pb.ClientResponsePb, len(batch.Committed))
 	errs := make([]error, len(batch.Committed))
 	opps := make([]map[string]string, len(batch.Committed))
-	opportunisticBlocks := opportunisticBlockStrings(batch.OpportunisticKeys)
+	// One share of the batch's candidates per request, never the whole list on
+	// every request (2026-09-19). See planHarvest for the measurement that forced
+	// this and for why splitting beats nominating a single carrier.
+	harvestPlan := s.planHarvest(batch.OpportunisticKeys, len(batch.Committed))
 	var wg sync.WaitGroup
 	for i, req := range batch.Committed {
 		wg.Add(1)
-		go func(i int, req *pb.ClientRequestPb) {
+		go func(i int, req *pb.ClientRequestPb, candidates []string) {
 			defer wg.Done()
 			// Bounded fan-out (2026-08-04): see the unionFanout field doc.
 			// Acquired here, ahead of accessSafe's own routerSlots gate,
@@ -665,7 +732,7 @@ func (s *Server) serveUnionBatch(ctx context.Context, queued queuedBatch) *pb.Ba
 				return
 			}
 			defer s.releaseUnionFanoutSlot()
-			val, opp, err := s.accessSafe(ctx, req, opportunisticBlocks)
+			val, opp, err := s.accessSafe(ctx, req, candidates)
 			if err != nil {
 				errs[i] = err
 				return
@@ -679,7 +746,7 @@ func (s *Server) serveUnionBatch(ctx context.Context, queued queuedBatch) *pb.Ba
 				ProxyReceivedMs:  recvMs,
 				ProxyRespondedMs: uint64(time.Now().UnixMilli()),
 			}
-		}(i, req)
+		}(i, req, harvestPlan[i])
 	}
 	wg.Wait()
 	// Degrade the failed slots in place rather than aborting the session. Every

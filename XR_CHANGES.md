@@ -290,6 +290,56 @@ best-effort semantics `access_scan` already has in path-oram (offered, never
 required; the orchestrator re-offers on a later batch).
 
 
+## Harvest fan-out bound (2026-09-19)
+
+The 2026-08-03 harvest above had an amplification defect on the adapter side, fixed
+here. `BackendSession` and `UnionSession` both handed the batch's **whole**
+`opportunistic_keys` list to **every** committed request. Combined with the router's
+documented broadcast — "hands that union to every request answered this round" — one
+batch's harvest crossed the router wire once per committed block instead of once.
+
+Measured on treebeard/v11-0 32users/30s: ~128 committed blocks x ~624 candidates, at
+102400-byte blocks against a shardnode stash holding ~87% of the dataset (so ~70% of
+candidates hit and returned a payload), moved **439 GB** over the server's loopback in a
+1,197 s run — 295x the 1.49 GB actually delivered to the orchestrator, against the
+passthrough baseline's 116 GB / 4.98 GB. The arm served 338 of 832 requests at 0.28
+req/s with all 32 streams censored; the baseline served 12,026 at 10.05 req/s. Server
+CPU sat at 87-94% moving duplicate harvest.
+
+The receive side cannot fix this: grpc-go unmarshals `OpportunisticServed` in full
+before `mergeHarvest` ever sees it, so the only lever is what the adapter **asks for**.
+
+- **`planHarvest`** splits one batch's candidates across that batch's committed requests
+  — each candidate is offered exactly once per batch — instead of replaying the list per
+  request. Splitting rather than nominating a single carrier request: no reply becomes
+  the straggler the whole batch waits for under `serveUnionBatch`'s `wg.Wait`, a failed
+  or canceled request costs 1/N of the harvest instead of all of it, no single protobuf
+  message holds the batch's entire harvest, and the candidates ride more epochs — which
+  matters because `getShardnodeBatches` drops a candidate whose shard has no real demand
+  in the epoch carrying it. The split is strided so losing one request costs a uniform
+  sample rather than a contiguous priority band.
+- **No adapter-side size cap.** How much harvest a batch pulls back is the
+  orchestrator's `opportunistic_max` and nothing else: the payload is that key count
+  times the size a block occupies on the router wire, and both ends already know both
+  terms. A byte budget here would be a third input to a two-input equation — redundant
+  when it agrees with `opportunistic_max`, a silent contradiction when it does not. At
+  the paper's settings the bound is 128 x base64(102400) = 16.7 MiB per batch, and
+  after the split the router never holds more than
+  `union_fanout_limit` x 1 x base64(102400) = 8.3 MiB of it in flight.
+- **`GetCapabilities`** no longer advertises `max_opportunistic_keys`. There is no
+  second number to advertise, and the old value, 4096, was copied from path-oram —
+  at this fork's block size it promised a ~560 MB reply.
+- **`treebeard-stats.csv`** gains `harvest_offered`, `harvest_received` and
+  `harvest_merged`. `harvest_received / harvest_merged` is the
+  wire duplication factor — 1.0 means each harvested block crossed once. It read ~128
+  before this change. Residual above ~1 is the router's per-epoch broadcast, which is
+  upstream behaviour this adapter bounds rather than modifies.
+
+Still upstream, still not modified: the router broadcasts the epoch-merged harvest to
+every caller in the epoch (`pkg/router/epoch.go`), and `getStashHarvest` returns every
+resident candidate uncapped (`pkg/shardnode/server.go`). Both remain as shipped; the
+adapter now bounds what reaches them.
+
 ## Fixed-block delivery validation (2026-08-11)
 
 The daos-xr adapter now treats Treebeard's configured `block_size` as a runtime
