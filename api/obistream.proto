@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package daos_xr;
+package obistream;
 
-option go_package = "github.com/dsg-uwaterloo/treebeard/api/daos_xr";
+option go_package = "github.com/dsg-uwaterloo/treebeard/api/obistream";
 
 enum RequestType {
   READ = 0;

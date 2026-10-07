@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/dsg-uwaterloo/treebeard/api/daos_xr"
+	pb "github.com/dsg-uwaterloo/treebeard/api/obistream"
 	routerpb "github.com/dsg-uwaterloo/treebeard/api/router"
 	"github.com/dsg-uwaterloo/treebeard/pkg/config"
 	"google.golang.org/grpc"

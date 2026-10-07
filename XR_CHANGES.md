@@ -14,17 +14,17 @@ All changes are additive — nothing in the upstream source is modified.
 | Path | Purpose |
 |------|---------|
 | `Makefile` | Builds `treebeard_grpc` adapter + upstream cluster binaries |
-| `api/daos_xr.proto` | Copy of `crates/proto/proto/daos_xr.proto` with `go_package` added |
-| `api/daos_xr/` | Generated gRPC stubs (`make proto`) |
+| `api/obistream.proto` | Copy of `crates/proto/proto/obistream.proto` with `go_package` added |
+| `api/obistream/` | Generated gRPC stubs (`make proto`) |
 | `cmd/grpc_server/main.go` | `treebeard_grpc` entry point |
 | `pkg/grpc_server/server.go` | BackendIngress / Capability / BatchUnionIngress implementations |
 
 ## Architecture
 
 ```
-daos-xr orchestrator
+obistream orchestrator
         │
-  daos_xr.proto (port 4000)
+  obistream.proto (port 4000)
         │
   treebeard_grpc (adapter)
         │
@@ -38,7 +38,7 @@ internal components — those are managed separately by the experiment ansible p
 
 ## Key translation decisions
 
-- **Block id**: daos-xr `uint32 key` → Treebeard `string block` = **`"k" + strconv.FormatUint(key)`**.
+- **Block id**: obistream `uint32 key` → Treebeard `string block` = **`"k" + strconv.FormatUint(key)`**.
   The `"k"` prefix is REQUIRED, not cosmetic. Treebeard stores each block's bucket-slot
   metadata as the string `"<pos><blockid>"` with **no separator**, and its reader
   (`storage.parseMetadataBlock`) recovers `<pos>` by scanning to the first NON-digit
@@ -53,17 +53,17 @@ internal components — those are managed separately by the experiment ansible p
   never parsing the block string back for the demand path. (Added 2026-07-15. As of
   2026-08-03 `blockToKey` in `pkg/grpc_server/server.go` does parse it back, but only for
   harvested opportunistic blocks, which have no `request_id` of their own — see below.)
-- **Value encoding**: daos-xr `[]byte` → base64 string in Router.Write; decoded on Router.Read
+- **Value encoding**: obistream `[]byte` → base64 string in Router.Write; decoded on Router.Read
 - **UNION** (`BatchUnionIngress`): committed blocks sent as concurrent goroutines to the
   router so they land within the same Treebeard epoch window (epoch_time ms). This is
   the natural UNION equivalent for Treebeard's epoch-batching architecture. Concurrency
   is bounded per batch by `--union-fanout-limit` (default 64) — see "UNION fan-out
   bound" below; it is not "every block in the batch at once."
-- **HARVEST**: advertised unconditionally (no capability needed, per the daos_xr wire
+- **HARVEST**: advertised unconditionally (no capability needed, per the obistream wire
   contract) since 2026-08-03 — see "Opportunistic stash harvest" below for how the
   per-bucket over-read that was deferred here is now exposed at the router gRPC level.
 - **Eager stream headers** (`stream.SendHeader(nil)` at the top of `BackendSession`
-  and `BatchUnionSession`): REQUIRED, not optional. The daos-xr orchestrator is a
+  and `BatchUnionSession`): REQUIRED, not optional. The obistream orchestrator is a
   tonic (Rust) client whose stream-open `.await` blocks until the server flushes its
   HTTP/2 response HEADERS frame. grpc-go withholds those headers until the handler's
   first `Send`, but these handlers `Recv` before they `Send` — so without an eager
@@ -86,7 +86,7 @@ Only the files listed above were added; rebase conflicts are not expected.
 ## Build
 
 ```bash
-# 1. Generate daos_xr gRPC stubs (one-time, or after proto changes):
+# 1. Generate obistream gRPC stubs (one-time, or after proto changes):
 make proto
 
 # 2. Build the adapter binary:
@@ -189,7 +189,7 @@ Adapter-only; no upstream Treebeard source touched.
 ## Router admission parity (2026-08-03)
 
 Treebeard's native client wraps Router RPCs in a global semaphore sized by
-`parameters.max-requests`. The daos-xr adapter bypasses that client, and initially omitted the
+`parameters.max-requests`. The obistream adapter bypasses that client, and initially omitted the
 equivalent gate: overlapping worker batches multiplied by UNION fan-out could therefore exceed
 the configured backend admission ceiling by an order of magnitude. Under a slow shard fold this
 also exercises the Router's 10-second epoch timeout repeatedly; late replies target unbuffered
@@ -211,7 +211,7 @@ to stop a single oversized batch from overwhelming one shard on its own). At
 `--batch-size 1024` that let one client-issued UNION batch inject up to 1024
 simultaneous `Router.Read` calls.
 
-Observed effect on the daos-xr side (2026-08-04, `experiments/treebeard/v10-0/`):
+Observed effect on the obistream side (2026-08-04, `experiments/treebeard/v10-0/`):
 the shardnode stash climbed monotonically over a run and pinned near 20,000 resident
 blocks, versus the non-UNION passthrough baseline's ~2,000-3,000 oscillating peak
 under the same workload. A saturated stash makes every ORAM access effectively
@@ -241,7 +241,7 @@ touched — `UnionSession`/`serveUnionBatch` are entirely in `pkg/grpc_server/se
 
 ## Opportunistic stash harvest (2026-08-03)
 
-Implements the `HARVEST` capability deferred above: the daos-xr orchestrator's
+Implements the `HARVEST` capability deferred above: the obistream orchestrator's
 `opportunistic_keys` (offered on every `BatchRequestPb`) are now served from each
 shard's resident stash at zero extra path I/O, mirroring the additive
 `access_scan`/`access_batch` harvest already shipped in the `path-oram` fork.
@@ -272,7 +272,7 @@ Purely additive across three layers, each already ADDITIVE surface (the
   answered this round — a candidate can live on a different shard than the one
   serving the caller's own block, so all of an epoch's callers see the whole epoch's
   harvest, not just their own shard's.
-- **`pkg/grpc_server/server.go`** (the daos-xr adapter) — `access`/`accessSafe` now
+- **`pkg/grpc_server/server.go`** (the obistream adapter) — `access`/`accessSafe` now
   take the batch's offered blocks (`keyToBlock` per offered key) and return the
   router's per-call harvest. `blockToKey` reverses the `"k"` + decimal mapping
   *only* for harvested blocks (see the block-id note above) since harvested entries
@@ -281,7 +281,7 @@ Purely additive across three layers, each already ADDITIVE surface (the
   (deduped by key, first writer wins) into `BatchResponsePb.opportunistic_served`.
   `GetCapabilities` hints `max_opportunistic_keys` (4096, matching path-oram); no
   capability bit is needed since harvest rides the common message shape
-  unconditionally (see `daos_xr.proto`).
+  unconditionally (see `obistream.proto`).
 
 Not handled: harvest candidates are dropped (never forwarded to a shard) when that
 shard has no real demand in the epoch, and when a shard reply times out or errors
@@ -342,15 +342,15 @@ adapter now bounds what reaches them.
 
 ## Fixed-block delivery validation (2026-08-11)
 
-The daos-xr adapter now treats Treebeard's configured `block_size` as a runtime
+The obistream adapter now treats Treebeard's configured `block_size` as a runtime
 contract. Every demand READ must return exactly that width. The experiment runner
 also enables `--validate-preload-payloads`, which checks the deterministic
-`DAOSXR01` population marker and little-endian key embedded in each payload;
+`OBISTR01` population marker and little-endian key embedded in each payload;
 harvested stash values are subject to the same check before they are exposed to
 the orchestrator.
 
 Router WRITE replies are accepted only when `success=true`. This fork's legacy
-daos-xr response message has no outcome field, while an empty WRITE value is the
+obistream response message has no outcome field, while an empty WRITE value is the
 canonical successful acknowledgment. A degraded WRITE therefore carries the
 adapter-private `TREEBEARD_BACKEND_FAILED` marker so the backend populator
 rejects it instead of counting it as an acknowledged write. Degraded READs remain
@@ -361,5 +361,5 @@ Population can now request exact readback verification. Treebeard experiments
 use two complete passes: the first exercises normal remapping/eviction after the
 writes, and the second proves the data remains retrievable after that exercise.
 The measured workload never starts if any key, outcome, width, or byte differs.
-All changes are confined to the daos-xr adapter and experiment tooling; no
+All changes are confined to the obistream adapter and experiment tooling; no
 Treebeard storage, router, shardnode, or ORAM algorithm source was changed.
