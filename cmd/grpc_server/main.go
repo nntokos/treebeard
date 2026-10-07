@@ -1,7 +1,7 @@
-// treebeard_grpc — daos-xr BackendIngress adapter for Treebeard.
+// treebeard_grpc — obistream BackendIngress adapter for Treebeard.
 //
 // Connects to a running Treebeard router (Router.Read / Router.Write gRPC),
-// and exposes daos_xr BackendIngress + Capability.
+// and exposes obistream BackendIngress + Capability.
 //
 // Usage: treebeard_grpc --port 4000 --router-addr localhost:8745 [--conf ./configs/default]
 package main
@@ -21,12 +21,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "github.com/dsg-uwaterloo/treebeard/api/daos_xr"
+	pb "github.com/dsg-uwaterloo/treebeard/api/obistream"
 	routerpb "github.com/dsg-uwaterloo/treebeard/api/router"
 )
 
 func main() {
-	port := flag.Int("port", 4000, "daos-xr BackendIngress listen port")
+	port := flag.Int("port", 4000, "obistream BackendIngress listen port")
 	routerAddr := flag.String("router-addr", "", "Treebeard router address (ip:port); overrides --conf")
 	confPath := flag.String("conf", "configs/default", "Treebeard configs directory (for router_endpoints.yaml + parameters.yaml)")
 	pidFile := flag.String("pid-file", "", "write PID here on startup (for ansible lifecycle)")
@@ -37,7 +37,7 @@ func main() {
 		"blocks from a SINGLE UNION batch allowed an outstanding Router call at once; "+
 			"1 serialises UNION batches like the non-UNION path (2026-08-04)")
 	validatePreloadPayloads := flag.Bool("validate-preload-payloads", false,
-		"require every READ to contain the DAOSXR01 marker and embedded requested key; enable for deterministic experiment populations")
+		"require every READ to contain the OBISTR01 marker and embedded requested key; enable for deterministic experiment populations")
 	flag.Parse()
 
 	if *pidFile != "" {

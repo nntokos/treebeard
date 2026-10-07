@@ -1,8 +1,8 @@
-// Package grpc_server implements daos-xr BackendIngress and Capability over a
+// Package grpc_server implements obistream BackendIngress and Capability over a
 // connected Treebeard Router client.
 //
-// Block key mapping:   daos-xr uint32 key  →  Treebeard string block id (decimal)
-// Value encoding:      daos-xr []byte       →  base64-encoded string in Treebeard Router
+// Block key mapping:   obistream uint32 key  →  Treebeard string block id (decimal)
+// Value encoding:      obistream []byte       →  base64-encoded string in Treebeard Router
 //
 // UNION mapping: the Router's epochManager (pkg/router/epoch.go) queues every
 // Read/Write it receives — regardless of which gRPC call it arrived on — and once
@@ -44,10 +44,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/dsg-uwaterloo/treebeard/api/daos_xr"
+	pb "github.com/dsg-uwaterloo/treebeard/api/obistream"
 )
 
-// Server wraps a Treebeard router client and implements the three daos-xr services.
+// Server wraps a Treebeard router client and implements the three obistream services.
 type Server struct {
 	pb.UnimplementedBackendIngressServer
 	pb.UnimplementedCapabilityServer
@@ -100,7 +100,7 @@ const degradedWriteMarker = "TREEBEARD_BACKEND_FAILED"
 // degradeBlock builds a visibly invalid answer for one request whose access
 // failed, and records it. READ failures remain empty so fixed-block validation
 // rejects them. WRITE failures carry a private adapter marker because the legacy
-// daos-xr protobuf has no outcome field and an empty WRITE value is otherwise a
+// obistream protobuf has no outcome field and an empty WRITE value is otherwise a
 // canonical success acknowledgement accepted by the population tool.
 //
 // Containment rationale: a per-block error used to abort the whole session with
@@ -263,7 +263,7 @@ func (s *Server) startStatsWriter() {
 	}()
 }
 
-// keyToBlock converts a daos-xr uint32 key to Treebeard's string block id.
+// keyToBlock converts an obistream uint32 key to Treebeard's string block id.
 //
 // The "k" prefix is REQUIRED, not cosmetic. Treebeard stores each block's bucket-slot
 // metadata as the string "<pos><blockid>" with NO separator, and its reader
@@ -281,7 +281,7 @@ func keyToBlock(key uint32) string {
 }
 
 // blockToKey reverses keyToBlock, stripping the "k" prefix. Used only to
-// translate harvested stash blocks (see access) back to daos-xr keys for
+// translate harvested stash blocks (see access) back to obistream keys for
 // OpportunisticBlockPb -- never applied to the router-facing block string
 // itself. (Added 2026-08-03.)
 func blockToKey(block string) (uint32, bool) {
@@ -295,7 +295,7 @@ func blockToKey(block string) (uint32, bool) {
 	return uint32(key), true
 }
 
-const preloadMagic = "DAOSXR01"
+const preloadMagic = "OBISTR01"
 
 // validateReadValue enforces Treebeard's fixed-block contract on every demand
 // read. Experiment runs may additionally validate the deterministic population
@@ -309,7 +309,7 @@ func (s *Server) validateReadValue(key uint32, value []byte) error {
 		return nil
 	}
 	if len(value) < len(preloadMagic)+4 || string(value[:len(preloadMagic)]) != preloadMagic {
-		return fmt.Errorf("read key %d failed DAOS-XR population marker validation", key)
+		return fmt.Errorf("read key %d failed Obistream population marker validation", key)
 	}
 	gotKey := uint32(value[8]) | uint32(value[9])<<8 | uint32(value[10])<<16 | uint32(value[11])<<24
 	if gotKey != key {
@@ -390,7 +390,7 @@ func (s *Server) access(ctx context.Context, req *pb.ClientRequestPb, opportunis
 	}
 }
 
-// opportunisticBlockStrings converts the daos-xr keys the orchestrator offered
+// opportunisticBlockStrings converts the obistream keys the orchestrator offered
 // as harvest candidates into Treebeard block ids for the router call. (Added
 // 2026-08-03.)
 func opportunisticBlockStrings(keys []uint32) []string {
@@ -405,7 +405,7 @@ func opportunisticBlockStrings(keys []uint32) []string {
 }
 
 // mergeHarvest folds one router call's harvested blocks into the batch-wide
-// accumulator, keyed by daos-xr key. Blocks that fail to decode or don't map
+// accumulator, keyed by obistream key. Blocks that fail to decode or don't map
 // back to a well-formed key are dropped -- harvest is best-effort by
 // contract. (Added 2026-08-03.)
 func (s *Server) mergeHarvest(acc map[uint32][]byte, harvested map[string]string) {
@@ -444,7 +444,7 @@ func opportunisticServedPb(acc map[uint32][]byte) []*pb.OpportunisticBlockPb {
 // GetCapabilities advertises UNION: the Router's epoch batching (see package doc)
 // gives UnionSession real atomic admission, not just client-side concurrency.
 // Opportunistic harvest (see access) needs no capability of its own -- the
-// daos_xr wire contract carries it unconditionally -- but max_opportunistic_keys
+// obistream wire contract carries it unconditionally -- but max_opportunistic_keys
 // bounds how many candidates are worth offering per batch.
 func (s *Server) GetCapabilities(_ context.Context, _ *pb.CapabilitiesReq) (*pb.CapabilitiesPb, error) {
 	return &pb.CapabilitiesPb{
@@ -454,7 +454,7 @@ func (s *Server) GetCapabilities(_ context.Context, _ *pb.CapabilitiesReq) (*pb.
 }
 
 // batchQueueDepth bounds each session's queue between the wire reader and the
-// service worker. The reader goroutine never stalls on service time (the daos-xr
+// service worker. The reader goroutine never stalls on service time (the obistream
 // scheduler dispatches fire-and-continue since 2026-07-19 and expects adapters to
 // keep reading frames); it blocks only when this queue is full — the deliberate
 // flood-backpressure backstop, which then propagates to the orchestrator via

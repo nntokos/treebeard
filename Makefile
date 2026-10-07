@@ -1,25 +1,25 @@
-# daos-xr-grpc additions on top of the upstream Treebeard repo.
-# Builds the gRPC adapter (treebeard_grpc) that exposes the daos_xr.proto
+# obistream-grpc additions on top of the upstream Treebeard repo.
+# Builds the gRPC adapter (treebeard_grpc) that exposes the obistream.proto
 # BackendIngress/Capability/BatchUnionIngress services over the running
 # Treebeard cluster (router + shardnode + oramnode + Redis).
 
 PROTO_DIR  := api
-DAOS_PROTO := $(PROTO_DIR)/daos_xr.proto
-DAOS_OUT   := $(PROTO_DIR)/daos_xr
+OBISTREAM_PROTO := $(PROTO_DIR)/obistream.proto
+OBISTREAM_OUT   := $(PROTO_DIR)/obistream
 
 .PHONY: all proto treebeard_grpc grpc_server clean_grpc
 
 all: treebeard_grpc
 
-# Generate daos_xr gRPC stubs (requires protoc + protoc-gen-go + protoc-gen-go-grpc).
-proto: $(DAOS_OUT)/daos_xr.pb.go
+# Generate obistream gRPC stubs (requires protoc + protoc-gen-go + protoc-gen-go-grpc).
+proto: $(OBISTREAM_OUT)/obistream.pb.go
 
-$(DAOS_OUT)/daos_xr.pb.go: $(DAOS_PROTO)
-	mkdir -p $(DAOS_OUT)
+$(OBISTREAM_OUT)/obistream.pb.go: $(OBISTREAM_PROTO)
+	mkdir -p $(OBISTREAM_OUT)
 	protoc --proto_path=$(PROTO_DIR) \
-	       --go_out=$(DAOS_OUT) --go_opt=paths=source_relative \
-	       --go-grpc_out=$(DAOS_OUT) --go-grpc_opt=paths=source_relative \
-	       daos_xr.proto
+	       --go_out=$(OBISTREAM_OUT) --go_opt=paths=source_relative \
+	       --go-grpc_out=$(OBISTREAM_OUT) --go-grpc_opt=paths=source_relative \
+	       obistream.proto
 
 # Build the gRPC adapter binary.
 treebeard_grpc: proto
@@ -32,7 +32,7 @@ cluster_binaries:
 	go build -o oramnode   ./cmd/oramnode/
 
 clean_grpc:
-	rm -f treebeard_grpc $(DAOS_OUT)/daos_xr.pb.go $(DAOS_OUT)/daos_xr_grpc.pb.go
+	rm -f treebeard_grpc $(OBISTREAM_OUT)/obistream.pb.go $(OBISTREAM_OUT)/obistream_grpc.pb.go
 
 # Regenerate upstream protos (unchanged from scripts/generate_protos.sh).
 proto_upstream:
