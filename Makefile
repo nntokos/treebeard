@@ -1,4 +1,4 @@
-# obistream-grpc additions on top of the upstream Treebeard repo.
+# obistream-adapter additions on top of the upstream Treebeard repo.
 # Builds the gRPC adapter (treebeard_grpc) that exposes the obistream.proto
 # BackendIngress/Capability/BatchUnionIngress services over the running
 # Treebeard cluster (router + shardnode + oramnode + Redis).

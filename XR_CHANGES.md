@@ -1,6 +1,6 @@
-# oasis-adapter changes
+# obistream-adapter changes
 
-Branch: `oasis-adapter`
+Branch: `obistream-adapter`
 Origin: `git@github.com:nntokos/treebeard.git` (cloned from upstream, remote renamed)
 Upstream: `https://github.com/dsg-uwaterloo/treebeard`
 Added: 2026-07-12
@@ -246,7 +246,7 @@ Implements the `HARVEST` capability deferred above: the obistream orchestrator's
 shard's resident stash at zero extra path I/O, mirroring the additive
 `access_scan`/`access_batch` harvest already shipped in the `path-oram` fork.
 Purely additive across three layers, each already ADDITIVE surface (the
-`oasis-adapter` adapter, or a proto message this fork already regenerates via
+`obistream-adapter` adapter, or a proto message this fork already regenerates via
 `scripts/generate_protos.sh`):
 
 - **`api/router.proto` / `api/shardnode.proto`** — `ReadRequest`/`WriteRequest` gain
