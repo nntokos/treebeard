@@ -1,0 +1,685 @@
+// Package grpc_server implements obistream BackendIngress and Capability over a
+// connected Treebeard Router client.
+//
+// Block key mapping:   obistream uint32 key  →  Treebeard string block id (decimal)
+// Value encoding:      obistream []byte       →  base64-encoded string in Treebeard Router
+//
+// Read batches submit bounded concurrent Router calls. The router groups calls
+// arriving within each epoch into shard batches; a transport batch can span epochs.
+package grpc_server
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	routerpb "github.com/dsg-uwaterloo/treebeard/api/router"
+	"github.com/dsg-uwaterloo/treebeard/pkg/config"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/dsg-uwaterloo/treebeard/api/obistream"
+)
+
+// Server wraps a Treebeard router client and implements BackendIngress.
+type Server struct {
+	pb.UnimplementedBackendIngressServer
+
+	router    routerpb.RouterClient
+	params    config.Parameters
+	statsPath string
+
+	// Enables constant-cost validation of the deterministic experiment payload.
+	validatePreloadPayloads bool
+
+	// Batches served concurrently per session (2026-08-01). See serveSession.
+	serveConcurrency int
+
+	// Router admission is global across sessions and batches. Treebeard's native
+	// client bounds outstanding Router RPCs with parameters.max-requests; the XR
+	// adapter replaces that client, so it must preserve the same safety invariant.
+	// Without this gate, serveConcurrency * read batch size could inject tens of
+	// thousands of calls and drive the Router's timeout path into an unbounded
+	// late-reply goroutine leak. Added 2026-08-03.
+	routerSlots              chan struct{}
+	routerInflight           atomic.Uint64
+	routerInflightPeak       atomic.Uint64
+	routerAdmissionWaits     atomic.Uint64
+	routerAdmissionWaitNs    atomic.Uint64
+	routerAdmissionMaxWaitNs atomic.Uint64
+
+	// A shared fan-out limit bounds outstanding calls from concurrent batches,
+	// independently of the router's larger admission ceiling.
+	unionFanout         int
+	unionFanoutSlots    chan struct{}
+	unionFanoutInflight atomic.Uint64
+	unionFanoutPeak     atomic.Uint64
+
+	// Opportunistic prefetch accounting (2026-09-19). These exist to make the duplication this
+	// adapter used to cause MEASURABLE rather than asserted: opportunisticPrefetchReceived counts
+	// every entry the router handed back across all replies, opportunisticPrefetchMerged counts
+	// the distinct blocks actually kept. Their ratio is the wire duplication factor
+	// -- 1.0 means every prefetched block crossed the router wire exactly once. It
+	// read ~128 before planOpportunisticPrefetch, because every request in a batch replayed the
+	// whole candidate list and the router answers each caller with the whole
+	// epoch's merged opportunistic-prefetch payload. Any value above ~1 that survives a run is the
+	// remaining router-side broadcast (pkg/router/epoch.go), not this adapter.
+	opportunisticPrefetchOffered  atomic.Uint64
+	opportunisticPrefetchReceived atomic.Uint64
+	opportunisticPrefetchMerged   atomic.Uint64
+
+	// Blocks answered with an EMPTY value because the access failed or panicked
+	// (2026-07-29). Nonzero means a backend operation genuinely failed — see
+	// degradeBlock. Stream-shutdown cancellation is counted separately because
+	// the orchestrator may cancel unused speculative work after all demand was
+	// delivered. Both counters are atomic because BackendSession fans out calls.
+	degradedBlocks atomic.Uint64
+	canceledBlocks atomic.Uint64
+}
+
+const degradedWriteMarker = "TREEBEARD_BACKEND_FAILED"
+
+// degradeBlock builds a visibly invalid answer for one request whose access
+// failed, and records it. READ failures remain empty so fixed-block validation
+// rejects them. WRITE failures carry a private adapter marker because the legacy
+// obistream protobuf has no outcome field and an empty WRITE value is otherwise a
+// canonical success acknowledgement accepted by the population tool.
+//
+// Containment rationale: a per-block error used to abort the whole session with
+// codes.Internal, and a gRPC stream is not resumable — every later request was
+// then orphaned and the orchestrator's client hung until --timeout-client instead
+// of failing fast. Answering the request visibly invalid lets the orchestrator complete its
+// failure path while keeping the session serving.
+func (s *Server) degradeBlock(req *pb.ClientRequestPb, recvMs uint64, cause error) *pb.ClientResponsePb {
+	label := "degraded"
+	n := uint64(0)
+	if errors.Is(cause, context.Canceled) || status.Code(cause) == codes.Canceled {
+		label = "canceled"
+		n = s.canceledBlocks.Add(1)
+	} else {
+		n = s.degradedBlocks.Add(1)
+	}
+	value := []byte(nil)
+	if req.RequestType == pb.RequestType_WRITE {
+		value = []byte(degradedWriteMarker)
+	}
+	log.Printf("treebeard: key %d %s (%d total this run): %v", req.Key, label, n, cause)
+	return &pb.ClientResponsePb{
+		RequestId:        req.RequestId,
+		RequestType:      req.RequestType,
+		Key:              req.Key,
+		Value:            value,
+		ProxyReceivedMs:  recvMs,
+		ProxyRespondedMs: uint64(time.Now().UnixMilli()),
+	}
+}
+
+// New returns a Server ready to serve gRPC. serveConcurrency is the number of
+// batches served in parallel per session (see serveSession); values below 1 are
+// clamped to 1, which reproduces the pre-2026-08-01 sequential behaviour.
+// unionFanout is the most blocks from a concurrent batch allowed an
+// outstanding Router.Read/Write at once (see the unionFanout field doc);
+// values below 1 are clamped to 1, which serialises read batches into the
+// same one-at-a-time shape as the non-UNION BackendSession path.
+// The opportunistic-prefetch size is the orchestrator's `opportunistic_max` alone;
+// this adapter adds no bound of its own, it only splits the offered list across the
+// batch's requests. See planOpportunisticPrefetch.
+func New(router routerpb.RouterClient, params config.Parameters, statsPath string, serveConcurrency int, unionFanout int, validatePreloadPayloads bool) *Server {
+	if serveConcurrency < 1 {
+		serveConcurrency = 1
+	}
+	if unionFanout < 1 {
+		unionFanout = 1
+	}
+	routerLimit := params.MaxRequests
+	if routerLimit < 1 {
+		routerLimit = 1
+	}
+	s := &Server{
+		router:                  router,
+		params:                  params,
+		statsPath:               statsPath,
+		serveConcurrency:        serveConcurrency,
+		routerSlots:             make(chan struct{}, routerLimit),
+		unionFanout:             unionFanout,
+		unionFanoutSlots:        make(chan struct{}, unionFanout),
+		validatePreloadPayloads: validatePreloadPayloads,
+	}
+	s.startStatsWriter()
+	return s
+}
+
+// acquireUnionFanoutSlot bounds how many blocks from ONE read batch may have
+// an outstanding Router call simultaneously. See the unionFanout field doc.
+// Mirrors acquireRouterSlot's cancellation handling: a waiter released by
+// ctx.Done() never consumes a slot.
+func (s *Server) acquireUnionFanoutSlot(ctx context.Context) error {
+	select {
+	case s.unionFanoutSlots <- struct{}{}:
+		current := s.unionFanoutInflight.Add(1)
+		atomicMax(&s.unionFanoutPeak, current)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseUnionFanoutSlot() {
+	s.unionFanoutInflight.Add(^uint64(0))
+	<-s.unionFanoutSlots
+}
+
+// acquireRouterSlot preserves Treebeard's configured max-requests admission
+// limit for every adapter-originated Router RPC. Waiting is deliberately at the
+// adapter boundary: queued work remains bounded by the existing batch queues and
+// never enters the Router's epoch/goroutine machinery until capacity is available.
+// The request context makes cancellation release a waiter without consuming a slot.
+func (s *Server) acquireRouterSlot(ctx context.Context) error {
+	select {
+	case s.routerSlots <- struct{}{}:
+		s.recordRouterAdmission()
+		return nil
+	default:
+	}
+
+	s.routerAdmissionWaits.Add(1)
+	started := time.Now()
+	select {
+	case s.routerSlots <- struct{}{}:
+		waited := uint64(time.Since(started))
+		s.routerAdmissionWaitNs.Add(waited)
+		atomicMax(&s.routerAdmissionMaxWaitNs, waited)
+		s.recordRouterAdmission()
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) recordRouterAdmission() {
+	current := s.routerInflight.Add(1)
+	atomicMax(&s.routerInflightPeak, current)
+}
+
+func (s *Server) releaseRouterSlot() {
+	s.routerInflight.Add(^uint64(0))
+	<-s.routerSlots
+}
+
+func atomicMax(dst *atomic.Uint64, value uint64) {
+	for old := dst.Load(); value > old && !dst.CompareAndSwap(old, value); old = dst.Load() {
+	}
+}
+
+// startStatsWriter publishes a crash-independent admission snapshot once per
+// second. The atomic rename means Ansible can fetch the file concurrently without
+// ever observing a partial CSV row. Added 2026-08-03.
+func (s *Server) startStatsWriter() {
+	if s.statsPath == "" {
+		return
+	}
+	write := func() {
+		body := fmt.Sprintf(
+			"timestamp_ms,router_inflight_limit,router_inflight,router_inflight_peak,router_admission_waits,router_admission_wait_ms_total,router_admission_wait_ms_max,degraded_blocks,canceled_blocks,union_fanout_limit,union_fanout_peak,opportunistic_prefetch_offered,opportunistic_prefetch_received,opportunistic_prefetch_merged\n%d,%d,%d,%d,%d,%.3f,%.3f,%d,%d,%d,%d,%d,%d,%d\n",
+			time.Now().UnixMilli(), cap(s.routerSlots), s.routerInflight.Load(),
+			s.routerInflightPeak.Load(), s.routerAdmissionWaits.Load(),
+			float64(s.routerAdmissionWaitNs.Load())/float64(time.Millisecond),
+			float64(s.routerAdmissionMaxWaitNs.Load())/float64(time.Millisecond),
+			s.degradedBlocks.Load(),
+			s.canceledBlocks.Load(),
+			cap(s.unionFanoutSlots), s.unionFanoutPeak.Load(),
+			s.opportunisticPrefetchOffered.Load(), s.opportunisticPrefetchReceived.Load(), s.opportunisticPrefetchMerged.Load(),
+		)
+		tmp := s.statsPath + ".tmp"
+		if err := os.WriteFile(tmp, []byte(body), 0644); err != nil {
+			log.Printf("treebeard: write adapter stats: %v", err)
+			return
+		}
+		if err := os.Rename(tmp, s.statsPath); err != nil {
+			log.Printf("treebeard: publish adapter stats: %v", err)
+		}
+	}
+	write()
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			write()
+		}
+	}()
+}
+
+// keyToBlock converts an obistream uint32 key to Treebeard's string block id.
+//
+// The "k" prefix is REQUIRED, not cosmetic. Treebeard stores each block's bucket-slot
+// metadata as the string "<pos><blockid>" with NO separator, and its reader
+// (storage.parseMetadataBlock) recovers <pos> by scanning to the first NON-digit
+// character. A purely numeric block id makes "<pos><id>" all digits, so the scan never
+// finds a boundary, block[:0]=="" and strconv.Atoi("") fails — surfacing as
+// "could not get offset from storage" on any bucket that holds a real (written-back)
+// block, which cumulatively wedges reads. Treebeard's own dummy ids ("dummyN") avoid
+// this because they start with a letter; prefixing every real id with a non-digit gives
+// it the same clean delimiter. The prefix is internal to the Treebeard cluster — the
+// adapter matches responses by request_id and never parses the block string back to a
+// key — so nothing else needs to change.
+func keyToBlock(key uint32) string {
+	return "k" + strconv.FormatUint(uint64(key), 10)
+}
+
+// blockToKey reverses keyToBlock, stripping the "k" prefix. Used only to
+// translate prefetched stash blocks (see access) back to obistream keys for
+// OpportunisticBlockPb -- never applied to the router-facing block string
+// itself. (Added 2026-08-03.)
+func blockToKey(block string) (uint32, bool) {
+	if len(block) < 2 || block[0] != 'k' {
+		return 0, false
+	}
+	key, err := strconv.ParseUint(block[1:], 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(key), true
+}
+
+const preloadMagic = "OBISTR01"
+
+// validateReadValue enforces Treebeard's fixed-block contract on every demand
+// read. Experiment runs may additionally validate the deterministic population
+// marker and embedded key; this catches a right-sized wrong-block response at
+// constant cost without scanning the payload.
+func (s *Server) validateReadValue(key uint32, value []byte) error {
+	if len(value) != s.params.BlockSize {
+		return fmt.Errorf("read key %d returned %d bytes, want configured block size %d", key, len(value), s.params.BlockSize)
+	}
+	if !s.validatePreloadPayloads {
+		return nil
+	}
+	if len(value) < len(preloadMagic)+4 || string(value[:len(preloadMagic)]) != preloadMagic {
+		return fmt.Errorf("read key %d failed Obistream population marker validation", key)
+	}
+	gotKey := uint32(value[8]) | uint32(value[9])<<8 | uint32(value[10])<<16 | uint32(value[11])<<24
+	if gotKey != key {
+		return fmt.Errorf("read key %d returned payload for key %d", key, gotKey)
+	}
+	return nil
+}
+
+// encodeValue encodes binary block data as a base64 string for Treebeard.
+func encodeValue(b []byte) string {
+	return base64.RawStdEncoding.EncodeToString(b)
+}
+
+// decodeValue decodes a base64 string from Treebeard back to binary block data.
+func decodeValue(s string) ([]byte, error) {
+	if s == "" {
+		return nil, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
+}
+
+// accessSafe is access with a panic barrier (2026-07-29). BackendSession fans a
+// batch out across goroutines, and a panic in one of those unwinds past its
+// caller and takes the whole backend process down — losing not just the batch but
+// every subsequent arm of a sweep sharing that backend. Converting it to an error
+// keeps the fault inside the one block, which degradeBlock then answers empty.
+func (s *Server) accessSafe(ctx context.Context, req *pb.ClientRequestPb, opportunisticBlocks []string) (val []byte, prefetched map[string]string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			val, prefetched, err = nil, nil, fmt.Errorf("panic serving key %d: %v", req.Key, r)
+		}
+	}()
+	return s.access(ctx, req, opportunisticBlocks)
+}
+
+// access performs one Treebeard read or write and returns the block value as
+// bytes plus any opportunistic candidates the router's shard happened to have
+// resident in its stash while folding this request into an epoch (see
+// router.proto opportunistic_blocks/opportunistic_served, added 2026-08-03).
+func (s *Server) access(ctx context.Context, req *pb.ClientRequestPb, opportunisticBlocks []string) ([]byte, map[string]string, error) {
+	if err := s.acquireRouterSlot(ctx); err != nil {
+		return nil, nil, fmt.Errorf("router admission for key %d: %w", req.Key, err)
+	}
+	defer s.releaseRouterSlot()
+
+	block := keyToBlock(req.Key)
+	switch req.RequestType {
+	case pb.RequestType_READ:
+		reply, err := s.router.Read(ctx, &routerpb.ReadRequest{Block: block, OpportunisticBlocks: opportunisticBlocks})
+		if err != nil {
+			return nil, nil, fmt.Errorf("router.Read block %s: %w", block, err)
+		}
+		val, err := decodeValue(reply.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("decodeValue block %s: %w", block, err)
+		}
+		if err := s.validateReadValue(req.Key, val); err != nil {
+			return nil, nil, err
+		}
+		return val, reply.OpportunisticServed, nil
+
+	case pb.RequestType_WRITE:
+		reply, err := s.router.Write(ctx, &routerpb.WriteRequest{
+			Block:               block,
+			Value:               encodeValue(req.Value),
+			OpportunisticBlocks: opportunisticBlocks,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("router.Write block %s: %w", block, err)
+		}
+		if !reply.Success {
+			return nil, nil, fmt.Errorf("router.Write block %s returned success=false", block)
+		}
+		return req.Value, reply.OpportunisticServed, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unknown request type %v", req.RequestType)
+	}
+}
+
+// planOpportunisticPrefetch splits one batch's offered candidates across that batch's committed
+// requests, returning the candidate list each request should carry. It caps the
+// batch's total opportunistic prefetch first, then strides the survivors across the parts.
+//
+// Why split, rather than give every request the whole list (fixed 2026-09-19):
+// the router answers each caller with the whole epoch's MERGED opportunistic-prefetch payload
+// (pkg/router/epoch.go, "all of an epoch's callers see the whole epoch's
+// opportunistic prefetch"), so N requests offering the same C candidates cost N*C block values
+// on the wire, not C. Measured on treebeard/v11-0 32users/30s: ~128 committed
+// blocks x ~624 candidates at a ~70% stash hit rate moved 439 GB over loopback in
+// a 1,197 s run -- 295x the payload actually delivered to the orchestrator --
+// against the passthrough baseline's 116 GB, and collapsed the arm to 0.28 req/s
+// where the baseline sustained 10.05. The receive side cannot fix this: grpc-go
+// unmarshals OpportunisticServed in full before mergeOpportunisticPrefetch ever sees it, so the
+// only lever is what the adapter ASKS for.
+//
+// Splitting keeps the batch's candidate coverage intact -- every retained
+// candidate is still offered exactly once -- and beats nominating one carrier
+// request on every axis that matters here: no single reply becomes the straggler
+// the whole batch waits for under serveBackendBatch's wg.Wait, a failed or canceled
+// request costs 1/N of the opportunistic prefetch instead of all of it, no one protobuf message
+// has to hold the batch's entire opportunistic prefetch at once, and on a multi-shard deployment
+// the candidates ride more epochs -- which matters because getShardnodeBatches
+// drops a candidate whose shard has no real demand in the epoch carrying it.
+//
+// How much opportunistic prefetch a batch pulls back is the orchestrator's `opportunistic_max`
+// and nothing else: the payload is that key count times the size a block occupies
+// on the router wire, and both ends already know both terms. A byte budget here
+// would be a third input to a two-input equation -- redundant when it agrees with
+// `opportunistic_max`, a silent contradiction when it does not -- so this adapter
+// deliberately imposes no ceiling of its own. `opportunistic_prefetch_offered` in the stats file
+// reports what it actually forwarded.
+//
+// The split is strided rather than contiguous so that losing any one request costs
+// a uniform sample of the offered range instead of a contiguous band of the
+// orchestrator's soonest-needed-first ordering.
+func (s *Server) planOpportunisticPrefetch(keys []uint32, parts int) [][]string {
+	if parts < 1 {
+		return nil
+	}
+	plan := make([][]string, parts)
+	if len(keys) == 0 {
+		return plan
+	}
+	for i, key := range keys {
+		part := i % parts
+		plan[part] = append(plan[part], keyToBlock(key))
+	}
+	s.opportunisticPrefetchOffered.Add(uint64(len(keys)))
+	return plan
+}
+
+// mergeOpportunisticPrefetch folds one router call's prefetched blocks into the batch-wide
+// accumulator, keyed by obistream key. Blocks that fail to decode or don't map
+// back to a well-formed key are dropped -- opportunistic prefetch is best-effort by
+// contract. (Added 2026-08-03.)
+func (s *Server) mergeOpportunisticPrefetch(acc map[uint32][]byte, prefetched map[string]string) {
+	s.opportunisticPrefetchReceived.Add(uint64(len(prefetched)))
+	for block, encoded := range prefetched {
+		key, ok := blockToKey(block)
+		if !ok {
+			continue
+		}
+		if _, exists := acc[key]; exists {
+			continue
+		}
+		val, err := decodeValue(encoded)
+		if err != nil {
+			continue
+		}
+		if err := s.validateReadValue(key, val); err != nil {
+			continue
+		}
+		acc[key] = val
+		s.opportunisticPrefetchMerged.Add(1)
+	}
+}
+
+// opportunisticServedPb flattens an opportunistic prefetch accumulator into the wire's
+// repeated OpportunisticBlockPb shape.
+func opportunisticServedPb(acc map[uint32][]byte) []*pb.OpportunisticBlockPb {
+	if len(acc) == 0 {
+		return nil
+	}
+	served := make([]*pb.OpportunisticBlockPb, 0, len(acc))
+	for key, val := range acc {
+		served = append(served, &pb.OpportunisticBlockPb{Key: key, Value: val})
+	}
+	return served
+}
+
+// batchQueueDepth bounds each session's queue between the wire reader and the
+// service worker. The reader goroutine never stalls on service time (the obistream
+// scheduler dispatches fire-and-continue since 2026-07-19 and expects adapters to
+// keep reading frames); it blocks only when this queue is full — the deliberate
+// flood-backpressure backstop, which then propagates to the orchestrator via
+// HTTP/2 flow control. Mirrors the orchestrator's own channel_capacity (1024).
+const batchQueueDepth = 1024
+
+// batchRecvStream is the shared shape of both session server streams.
+type batchRecvStream interface {
+	Recv() (*pb.BatchRequestPb, error)
+	Context() context.Context
+}
+
+// pumpBatches decouples the wire from service: a reader goroutine pulls frames
+// into a bounded channel so the handler can serve batches at the backend's pace
+// while further requests keep arriving. The goroutine exits on EOF, stream error,
+// or stream-context cancellation (the handler returning cancels the context, so
+// an early service error cannot leak the reader).
+//
+// queuedBatch carries the frame transport-ingress time through adapter queueing.
+// time.Time retains its monotonic reading for local duration arithmetic while
+// UnixMilli supplies the protobuf epoch clock domain.
+type queuedBatch struct {
+	batch      *pb.BatchRequestPb
+	receivedAt time.Time
+}
+
+func pumpBatches(stream batchRecvStream) (<-chan queuedBatch, <-chan error) {
+	batches := make(chan queuedBatch, batchQueueDepth)
+	errc := make(chan error, 1)
+	ctx := stream.Context()
+	go func() {
+		defer close(batches)
+		for {
+			batch, err := stream.Recv()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				errc <- err
+				return
+			}
+			receivedAt := time.Now()
+			select {
+			case batches <- queuedBatch{batch: batch, receivedAt: receivedAt}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return batches, errc
+}
+
+// sendableStream is the shared shape of both session server streams, adding the
+// Send half that serveSession serialises.
+type sendableStream interface {
+	batchRecvStream
+	Send(*pb.BatchResponsePb) error
+	SendHeader(metadata.MD) error
+}
+
+// serveSession drives one session: it pumps frames off the wire and serves up to
+// serveConcurrency batches in parallel, serialising only the Send.
+//
+// # Why batches must overlap (2026-08-01)
+//
+// Both handlers used to serve batches strictly sequentially — `for queued := range
+// batches { serve; Send }` — so exactly ONE batch was ever in service, no matter how
+// many the orchestrator had dispatched. pumpBatches decoupled the *reader* from
+// service, but not service from itself, which capped the adapter near
+// 1/(per-batch latency) backend ops per second regardless of every tuning knob on
+// either side.
+//
+// That is the wrong shape for Treebeard specifically. Its router (pkg/router/epoch.go)
+// queues every Read/Write into the current epoch and, on each tick, fires the whole
+// epoch as ONE ShardNode.BatchQuery per shard **in its own goroutine** — epochs never
+// block each other, and one fold costs roughly one shard round-trip however many
+// requests it carries. The design assumes many callers waiting concurrently; a single
+// sequential caller puts one batch's worth of requests into each epoch and pays a full
+// round-trip for it, discarding the amortisation the backend exists to provide.
+//
+// Both sessions use bounded concurrent admission for read-only batches. Requests
+// land in whichever router epoch they reach; admission limits and epoch timing
+// can split a batch across epochs.
+//
+// Out-of-order batch completion is safe: the orchestrator's response router matches on
+// request id via its route map, not on arrival order.
+func (s *Server) serveSession(
+	stream sendableStream,
+	serve func(ctx context.Context, queued queuedBatch) *pb.BatchResponsePb,
+) error {
+	// Flush response headers eagerly. The orchestrator (tonic) blocks on the
+	// stream-open RPC until the server sends its response HEADERS frame, but these
+	// handlers read before they write and grpc-go withholds headers until the first
+	// Send — deadlocking the dial. Sending headers up front unblocks the client.
+	if err := stream.SendHeader(nil); err != nil {
+		return err
+	}
+	ctx := stream.Context()
+	batches, recvErr := pumpBatches(stream)
+
+	// grpc-go forbids concurrent SendMsg on one stream, so responses funnel through
+	// this mutex. It is held only for the marshal/write, never across a backend access.
+	var sendMu sync.Mutex
+	var sendErr atomic.Pointer[error]
+
+	var wg sync.WaitGroup
+	for i := 0; i < s.serveConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for queued := range batches {
+				// A failed Send means the stream is gone; stop serving but keep
+				// draining so the reader goroutine is never left blocked on the
+				// queue (it also exits via ctx.Done once the handler returns).
+				if sendErr.Load() != nil {
+					continue
+				}
+				resp := serve(ctx, queued)
+				sendMu.Lock()
+				err := stream.Send(resp)
+				sendMu.Unlock()
+				if err != nil {
+					sendErr.CompareAndSwap(nil, &err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := sendErr.Load(); err != nil {
+		return *err
+	}
+	select {
+	case err := <-recvErr:
+		return err
+	default:
+		return nil
+	}
+}
+
+// Read batches use bounded concurrent router admission.
+func (s *Server) BackendSession(stream pb.BackendIngress_BackendSessionServer) error {
+	return s.serveSession(stream, s.serveBackendBatch)
+}
+
+func (s *Server) serveBackendBatch(ctx context.Context, queued queuedBatch) *pb.BatchResponsePb {
+	batch := queued.batch
+	recvMs := uint64(queued.receivedAt.UnixMilli())
+	responses := make([]*pb.ClientResponsePb, len(batch.Committed))
+	errs := make([]error, len(batch.Committed))
+	opps := make([]map[string]string, len(batch.Committed))
+	// One share of the batch's candidates per request, never the whole list on
+	// every request (2026-09-19). See planOpportunisticPrefetch for the measurement that forced
+	// this and for why splitting beats nominating a single carrier.
+	prefetchPlan := s.planOpportunisticPrefetch(batch.OpportunisticKeys, len(batch.Committed))
+	var wg sync.WaitGroup
+	for i, req := range batch.Committed {
+		wg.Add(1)
+		go func(i int, req *pb.ClientRequestPb, candidates []string) {
+			defer wg.Done()
+			// Bounded fan-out (2026-08-04): see the unionFanout field doc.
+			// Acquired here, ahead of accessSafe's own routerSlots gate,
+			// because that gate is a global cross-batch ceiling sized to
+			// Treebeard's own max_requests (~8000) — far too loose on its
+			// own to stop one oversized batch from overwhelming a shard's
+			// stash.
+			if err := s.acquireUnionFanoutSlot(ctx); err != nil {
+				errs[i] = fmt.Errorf("union fan-out admission for key %d: %w", req.Key, err)
+				return
+			}
+			defer s.releaseUnionFanoutSlot()
+			val, opp, err := s.accessSafe(ctx, req, candidates)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			opps[i] = opp
+			responses[i] = &pb.ClientResponsePb{
+				RequestId:        req.RequestId,
+				RequestType:      req.RequestType,
+				Key:              req.Key,
+				Value:            val,
+				ProxyReceivedMs:  recvMs,
+				ProxyRespondedMs: uint64(time.Now().UnixMilli()),
+			}
+		}(i, req, prefetchPlan[i])
+	}
+	wg.Wait()
+	// Degrade the failed slots in place rather than aborting the session. Every
+	// slot must be non-nil before Send: a nil element would otherwise be
+	// marshalled as a zero-valued response the orchestrator cannot attribute.
+	for i, err := range errs {
+		if err != nil || responses[i] == nil {
+			if err == nil {
+				err = errors.New("access returned no response")
+			}
+			responses[i] = s.degradeBlock(batch.Committed[i], recvMs, err)
+		}
+	}
+	prefetched := make(map[uint32][]byte)
+	for _, opp := range opps {
+		s.mergeOpportunisticPrefetch(prefetched, opp)
+	}
+	return &pb.BatchResponsePb{BatchId: batch.BatchId, Responses: responses, OpportunisticServed: opportunisticServedPb(prefetched)}
+}

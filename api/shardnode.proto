@@ -14,11 +14,19 @@ service ShardNode {
 message RequestBatch {
     repeated ReadRequest read_requests = 1;
     repeated WriteRequest write_requests = 2;
+    // Union of opportunistic candidate blocks offered by the epoch's requests
+    // that route to this shard, per router.proto's opportunistic_blocks.
+    // (Added 2026-08-03.)
+    repeated string opportunistic_blocks = 3;
 }
 
 message ReplyBatch {
     repeated ReadReply read_replies = 1;
     repeated WriteReply write_replies = 2;
+    // Subset of opportunistic_blocks found resident in this shard's stash
+    // while serving the batch -- a plain map read under the existing stash
+    // lock, no extra path I/O. (Added 2026-08-03.)
+    map<string, string> opportunistic_served = 3;
 }
 
 message ReadRequest {
